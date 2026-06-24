@@ -1,0 +1,26 @@
+# Data and models — deposited on Zenodo, not GitHub
+*.pkl
+*.joblib
+*.fits
+*.fits.gz
+*_rf_optical_v2*
+data/
+models/
+targets/*/processed/
+targets/*/plots/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+
+# Environments
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
