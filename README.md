@@ -23,7 +23,7 @@ translate ground-based photometry into HST PHAT bandpasses, builds a uniform
   Stage 2 resolves OTHER into the **3 classes LMXB / HMXB / CV**.
 - **Class imbalance:** handled by the Random Forest's
   `class_weight="balanced_subsample"` — **no SMOTE**.
-- **Cross-validated performance:** balanced accuracy ≈ 0.91 (5-fold).
+- **Cross-validated performance:** balanced accuracy ≈ 0.90 (5-fold).
 
 ## Paper reference
 
@@ -34,7 +34,7 @@ sources in nearby spiral galaxies."*
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USERNAME/xclass.git
+git clone https://github.com/blagoyrangelov/xclass.git
 cd xclass
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -42,8 +42,7 @@ pip install -e .
 ```
 
 Python 3.11+ is required. The pipeline depends on `astropy`, `astroquery`,
-`scikit-learn`, `synphot`, `xgboost` (an optional alternative classifier,
-selectable via `model_type`), and the standard scientific stack.
+`scikit-learn`, `synphot`, and the standard scientific stack.
 
 ## Reproducing the paper
 
@@ -89,7 +88,7 @@ python scripts/run_pipeline.py --stage apply --target M31_PHAT
 Input data and trained models are **not** bundled in this repository. The
 training catalog (`translated_catalog_optical.csv`) and the production models
 (`*_rf_optical_v2`) are available from the Zenodo deposit
-**[ZENODO_DOI]**. The public input catalogs — Chandra CSC 2.0, PanSTARRS DR2,
+[10.5281/zenodo.20838124](https://doi.org/10.5281/zenodo.20838124). The public input catalogs — Chandra CSC 2.0, PanSTARRS DR2,
 2MASS PSC, HSC v3, and the VizieR training labels — are cited in the paper and
 obtained from their respective archives.
 
