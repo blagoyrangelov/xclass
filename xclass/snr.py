@@ -351,6 +351,23 @@ def build_snr_ml_catalog(snr_df: pd.DataFrame) -> pd.DataFrame:
         Fx_S/M/H/B (NaN), significance (NaN), plus any HST magnitude columns
         present in the input (A_F* prefix).
     """
+    # Handle the empty-input case: if no SNR catalogs were fetched (e.g. all
+    # VizieR queries failed due to a network outage), snr_df has no columns and
+    # indexing ["ra"] would raise KeyError. Return a correctly-shaped empty
+    # catalog so the pipeline can proceed without SNR sources rather than crash.
+    if snr_df.empty:
+        log.warning(
+            "build_snr_ml_catalog: input SNR catalog is empty; "
+            "returning empty SNR catalog (0 sources). This usually means the "
+            "SNR literature fetch failed — check network/VizieR availability."
+        )
+        base_cols = [
+            "class_label", "ra", "dec", "host_galaxy", "source_name",
+            "label_confidence", "Fx_S", "Fx_M", "Fx_H", "Fx_B", "significance",
+        ]
+        hst_mag_cols = [c for c in snr_df.columns if c.startswith("A_F")]
+        return pd.DataFrame(columns=base_cols + hst_mag_cols)
+
     hst_mag_cols = [c for c in snr_df.columns if c.startswith("A_F")]
 
     out = pd.DataFrame({
