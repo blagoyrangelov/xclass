@@ -7,7 +7,7 @@ point sources in nearby galaxies into seven physical source classes — AGN, LMX
 HMXB, CV, low-mass stars, high-mass stars, and SNRs — using SED-translated
 photometry from PanSTARRS and 2MASS (plus HSC for the application field), fed
 into a two-stage Random Forest classifier. The pipeline ingests Chandra Source
-Catalog (CSC 2.0) detections, fits a per-source spectral energy distribution to
+Catalog (CSC 2.1.1) detections, fits a per-source spectral energy distribution to
 translate ground-based photometry into HST PHAT bandpasses, builds a uniform
 22-feature matrix, and produces calibrated class probabilities for each source.
 
@@ -68,10 +68,14 @@ The end-to-end pipeline is also exposed as CLI subcommands of
 # 1. Build the training catalog from VizieR (LMXB, HMXB, CV, AGN, stars, SNR)
 python scripts/run_pipeline.py --stage build_td
 
-# 2. Crossmatch training sources to Chandra CSC 2.0 + query PanSTARRS/2MASS
+# 2. Crossmatch training sources to Chandra CSC 2.1.1 + query PanSTARRS/2MASS
 python scripts/run_pipeline.py --stage crossmatch
 
-# 3. Translate per-source SEDs to PHAT-equivalent magnitudes
+# 3. Translate per-source SEDs to PHAT-equivalent magnitudes.
+#    SNRs carry real HST photometry (nothing to SED-translate), so this stage
+#    also fetches their six PHAT magnitudes from HSC v3 (MAST) and writes them
+#    straight into the *_pred columns — this is what keeps the SNR class in the
+#    training set. Requires network access to MAST during this stage.
 python scripts/run_pipeline.py --stage translate
 
 # 4. Train the production two-stage classifier (optical baseline, no SMOTE,
@@ -83,12 +87,30 @@ python scripts/run_pipeline.py --stage train
 python scripts/run_pipeline.py --stage apply --target M31_PHAT
 ```
 
+The four training stages (`build_td → crossmatch → translate → train`) reproduce
+the published catalog (**11,374** sources, all four Stage-1 classes) and metrics
+end to end — no out-of-band scripts are required.
+
+**Translate-stage reproducibility notes:**
+
+- **SNR HSC photometry.** The `translate` stage queries HSC v3 for every SNR. If
+  HSC/MAST is unreachable the stage **fails loudly** rather than silently dropping
+  the SNR class (which would yield a 3-class model that does not match the paper).
+  For offline / outage-resilient reproduction, point it at a pre-fetched HSC cache:
+  `--stage translate --snr-hsc-cache path/to/hsc_snr_fix` (the published SNR HSC
+  responses are provided in the Zenodo deposit under `data/query_cache/hsc_snr_fix/`).
+- **Translation cache.** `translate` caches its result in
+  `data/processed/sed_translation_cache.csv` and reuses it **only** when a
+  fingerprint of the inputs matches (a stale cache from different inputs is ignored,
+  not silently reused). This cache is *not* shipped; force a clean retranslation
+  with `--stage translate --force-retranslate`.
+
 ## Data and trained models
 
 Input data and trained models are **not** bundled in this repository. The
 training catalog (`translated_catalog_optical.csv`) and the production models
 (`*_rf_optical_v2`) are available from the Zenodo deposit
-[10.5281/zenodo.20838124](https://doi.org/10.5281/zenodo.20838124). The public input catalogs — Chandra CSC 2.0, PanSTARRS DR2,
+[10.5281/zenodo.20838124](https://doi.org/10.5281/zenodo.20838124). The public input catalogs — Chandra CSC 2.1.1, PanSTARRS DR2,
 2MASS PSC, HSC v3, and the VizieR training labels — are cited in the paper and
 obtained from their respective archives.
 
@@ -116,7 +138,7 @@ data/                    Created at runtime (gitignored)
 
 The `data/` tree is created on first run and is not tracked in git. It contains:
 
-- `data/raw/` — input catalogs (e.g. the Chandra CSC 2.0 export)
+- `data/raw/` — input catalogs (e.g. the Chandra CSC 2.1.1 export)
 - `data/query_cache/` — per-source pickle cache for survey queries
 - `data/processed/` — pipeline outputs (training catalog, translated catalog, …)
 - `data/models/` — saved `.joblib` classifier files

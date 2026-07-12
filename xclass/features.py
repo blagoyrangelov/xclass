@@ -43,7 +43,7 @@ def _get_flux_col(df: pd.DataFrame, short: str) -> pd.Series:
 
     Checks in order:
       1. ``Fx_{short}``          — training-data convention
-      2. ``flux_aper90_avg_{lower}`` — CSC 2.0 convention
+      2. ``flux_aper90_avg_{lower}`` — CSC 2.1.1 convention
     Returns an all-NaN series if neither is present.
     """
     candidates = [f"Fx_{short}", f"flux_aper90_avg_{short.lower()}"]
@@ -68,7 +68,7 @@ def compute_hardness_ratios(df: pd.DataFrame) -> pd.DataFrame:
     df : pd.DataFrame
         Must contain X-ray band flux columns in one of the supported naming
         conventions: ``Fx_S/M/H/B`` (training data) or
-        ``flux_aper90_avg_s/m/h/b`` (CSC 2.0 application data).
+        ``flux_aper90_avg_s/m/h/b`` (CSC 2.1.1 application data).
         Missing bands produce all-NaN hardness ratios.
 
     Returns

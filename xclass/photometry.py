@@ -17,7 +17,10 @@ fnu_to_nuFnu
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -26,6 +29,21 @@ import pandas as pd
 from xclass import config
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# SNR HSC bypass — SNRs carry real HST photometry (nothing to SED-translate);
+# their six PHAT *_pred magnitudes are filled directly from HSC v3.
+# ---------------------------------------------------------------------------
+# PHAT _pred column prefix -> HSC v3 short filter name.
+_SNR_HSC_FILTER_MAP: dict[str, str] = {
+    "UVIS_F275W": "F275W",
+    "UVIS_F336W": "F336W",
+    "ACS_F475W":  "F475W",
+    "ACS_F814W":  "F814W",
+    "IR_F110W":   "F110W",
+    "IR_F160W":   "F160W",
+}
+_SNR_HSC_SEARCH_RADIUS_ARCSEC: float = 0.5
 
 # AB system zero-point constant (CGS): m = -2.5*log10(f_nu) - 48.60
 # where f_nu is in erg/s/cm^2/Hz
@@ -354,6 +372,213 @@ def translate_source_to_hst(
 # ---------------------------------------------------------------------------
 
 
+def _snr_row_mask(out: pd.DataFrame) -> pd.Series:
+    """Boolean mask of SNR rows, robust to whether the label lives in ``Class``,
+    ``td_Class`` or ``class_label`` (a fresh crossmatch leaves SNR rows with only
+    ``td_Class`` set)."""
+    mask = pd.Series(False, index=out.index)
+    for col in ("Class", "td_Class", "class_label"):
+        if col in out.columns:
+            mask = mask | (out[col].astype(str) == "SNR")
+    return mask
+
+
+def apply_snr_hsc_bypass(
+    out: pd.DataFrame,
+    cache_dir: str | Path,
+    search_radius_arcsec: float = _SNR_HSC_SEARCH_RADIUS_ARCSEC,
+) -> pd.DataFrame:
+    """Fill the six PHAT ``*_pred`` columns for SNR rows with real HSC v3 magnitudes.
+
+    SNRs bypass SED translation — they already carry real HST photometry — so we
+    query HSC v3 at each SNR's optical position (``td_ra``/``td_dec``) and slot the
+    magnitudes straight into the ``_pred`` columns (nearest match by ``D``; median
+    ``MagAper2`` per filter within 0.5"), matching the historical
+    ``scripts/fix_snr_hst_photometry.py`` behaviour.
+
+    Fails loudly rather than silently dropping the SNR class:
+
+    * **partial** coverage -> ``WARNING`` naming how many SNRs were lost and why;
+    * **total** SNR loss    -> ``RuntimeError`` (a 3-class model would not reproduce
+      the published 4-class catalog).
+
+    Network failures (``_hsc_fetch_one`` returns ``None``) are counted separately
+    from genuine no-counterpart responses so an HSC outage is unambiguous.  *out*
+    is modified in place and returned.
+    """
+    from xclass.query import _hsc_fetch_one
+
+    snr_mask = _snr_row_mask(out)
+    n_snr = int(snr_mask.sum())
+    if n_snr == 0:
+        log.info("SNR HSC bypass: no SNR rows in catalog — nothing to do.")
+        return out
+    if "td_canonical_name" not in out.columns or \
+            "td_ra" not in out.columns or "td_dec" not in out.columns:
+        raise RuntimeError(
+            "SNR HSC bypass: catalog has SNR rows but is missing "
+            "td_canonical_name / td_ra / td_dec — cannot query HSC. "
+            "Was the SNR crossmatch (_build_snr_xray_rows) run before translate?"
+        )
+
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    phat = {k: v for k, v in _SNR_HSC_FILTER_MAP.items() if f"{k}_pred" in out.columns}
+
+    # Coerce target dtypes so scalar assignment is safe under pandas' strict
+    # setitem (>=2.x): the _pred columns must accept floats, and the status flag
+    # column (int-typed from SED fitting) must accept the 'real_hsc_photometry'
+    # string marker.
+    for pred_key in phat:
+        col = f"{pred_key}_pred"
+        if not pd.api.types.is_float_dtype(out[col].dtype):
+            out[col] = out[col].astype(float)
+    if "xclass_status_flag" in out.columns:
+        out["xclass_status_flag"] = out["xclass_status_flag"].astype(object)
+
+    log.info("SNR HSC bypass: querying HSC v3 for %d SNR sources (cache=%s)…",
+             n_snr, cache_dir)
+
+    n_patched = n_net_fail = n_no_counterpart = 0
+    for idx in out.index[snr_mask]:
+        sid = str(out.at[idx, "td_canonical_name"])
+        try:
+            ra = float(out.at[idx, "td_ra"]); dec = float(out.at[idx, "td_dec"])
+        except (TypeError, ValueError):
+            n_no_counterpart += 1
+            continue
+
+        dets = _hsc_fetch_one(sid, ra, dec, search_radius_arcsec, cache_dir)
+        if dets is None:                    # network / API failure (not cached)
+            n_net_fail += 1
+            continue
+        if not dets:                        # genuine empty response (cached)
+            n_no_counterpart += 1
+            continue
+
+        # nearest match by 'D'
+        best_id, min_d = None, float("inf")
+        for det in dets:
+            try:
+                d_f = float(det.get("D", float("inf")))
+            except (TypeError, ValueError):
+                continue
+            if d_f < min_d:
+                min_d, best_id = d_f, det.get("MatchID")
+        if best_id is None:
+            best_id = dets[0].get("MatchID")
+
+        mags: dict[str, list[float]] = {v: [] for v in phat.values()}
+        for det in dets:
+            if det.get("MatchID") != best_id:
+                continue
+            raw = str(det.get("Filter", "")).strip()
+            fshort = raw.split("/")[-1] if "/" in raw else raw
+            if fshort in mags:
+                try:
+                    mags[fshort].append(float(det["MagAper2"]))
+                except (TypeError, ValueError, KeyError):
+                    pass
+
+        n_filt = 0
+        for pred_key, fshort in phat.items():
+            vals = mags[fshort]
+            if vals:
+                out.at[idx, f"{pred_key}_pred"] = float(np.median(vals))
+                n_filt += 1
+        if n_filt > 0:
+            n_patched += 1
+            if "xclass_status_flag" in out.columns:
+                out.at[idx, "xclass_status_flag"] = "real_hsc_photometry"
+        else:
+            n_no_counterpart += 1
+
+    n_lost = n_snr - n_patched
+    log.info("SNR HSC bypass: %d/%d SNRs patched with >=1 PHAT filter "
+             "(%d no-counterpart, %d network failures).",
+             n_patched, n_snr, n_no_counterpart, n_net_fail)
+
+    if n_patched == 0:
+        # Total SNR loss -> the optical-baseline cut would drop the whole SNR class,
+        # silently yielding a 3-class model.  Refuse instead.
+        if n_net_fail > 0:
+            raise RuntimeError(
+                f"SNR HSC bypass: ALL {n_snr} SNR HSC queries failed "
+                f"({n_net_fail} network/API errors, {n_no_counterpart} empty). HSC "
+                f"(MAST) appears UNREACHABLE, so the SNR class would be dropped and "
+                f"the run would NOT reproduce the published 4-class catalog. Re-run "
+                f"when HSC is reachable, or point --snr-hsc-cache at a populated "
+                f"cache (e.g. data/query_cache/hsc_snr_fix)."
+            )
+        raise RuntimeError(
+            f"SNR HSC bypass: 0/{n_snr} SNRs have any HSC PHAT-filter counterpart. "
+            f"The SNR class would be dropped, giving a 3-class model that does NOT "
+            f"reproduce the published catalog. Check SNR positions / HSC coverage."
+        )
+    if n_lost > 0:
+        log.warning(
+            "SNR HSC bypass: %d/%d SNRs have NO usable HSC PHAT photometry "
+            "(%d network failures, %d genuine no-counterpart) and will be dropped by "
+            "the optical-baseline cut. The published run recovered 108/150; results "
+            "reproduce the paper only insofar as SNR coverage matches. If the losses "
+            "are network failures, re-run when HSC is reachable (failures are NOT "
+            "cached) or supply --snr-hsc-cache.",
+            n_lost, n_snr, n_net_fail, n_no_counterpart,
+        )
+    return out
+
+
+def _translate_cache_fingerprint(
+    df: pd.DataFrame,
+    all_filter_names: list[str],
+    agn_composite: Optional[tuple[np.ndarray, np.ndarray]],
+) -> str:
+    """Content fingerprint of the *inputs* to a translation run.
+
+    A cache is only reused if its sidecar manifest carries a matching fingerprint,
+    so a stale cache built from different inputs (e.g. a pre-SNR snapshot) can never
+    be silently reused on mere path existence.
+    """
+    h = hashlib.sha256()
+    h.update(str(len(df)).encode())
+    h.update(",".join(map(str, sorted(map(str, df.columns)))).encode())
+    try:
+        h.update(pd.util.hash_pandas_object(df, index=True).values.tobytes())
+    except Exception:
+        for c in ("td_canonical_name", "td_ra", "td_dec", "Class", "td_Class"):
+            if c in df.columns:
+                h.update(df[c].astype(str).str.cat(sep="|").encode())
+    h.update(",".join(map(str, config.PHAT_FILTER_SET)).encode())
+    h.update(",".join(map(str, all_filter_names)).encode())
+    h.update(f"agn_composite={agn_composite is not None}".encode())
+    # Bump this tag whenever the translation logic changes semantics.
+    h.update(b"translate_logic=snr_hsc_bypass_v1")
+    return h.hexdigest()
+
+
+def _cache_manifest_path(cache_path: str | Path) -> Path:
+    return Path(str(cache_path) + ".manifest.json")
+
+
+def _read_cache_manifest(cache_path: str | Path) -> Optional[dict]:
+    p = _cache_manifest_path(cache_path)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return None
+
+
+def _write_cache_manifest(cache_path: str | Path, fingerprint: str, n_rows: int) -> None:
+    try:
+        _cache_manifest_path(cache_path).write_text(
+            json.dumps({"fingerprint": fingerprint, "n_rows": int(n_rows)})
+        )
+    except Exception as exc:
+        log.warning("translate_catalog: could not write cache manifest: %s", exc)
+
+
 def translate_catalog(
     df: pd.DataFrame,
     filter_curves: dict[str, tuple[np.ndarray, np.ndarray]],
@@ -362,14 +587,19 @@ def translate_catalog(
     agn_composite: Optional[tuple[np.ndarray, np.ndarray]],
     n_jobs: int = -1,
     cache_path: Optional[str] = None,
+    force: bool = False,
+    snr_hsc: bool = True,
+    snr_hsc_cache_dir: Optional[str | Path] = None,
 ) -> pd.DataFrame:
     """Translate all rows in *df* to the universal HST filter set.  [C2]
 
     Applies ``translate_source_to_hst`` to every row using
     ``joblib.Parallel`` with a ``tqdm`` progress bar.
 
-    If *cache_path* is given and exists, the cached result is returned
-    immediately.  After a full run, the result is saved to *cache_path*.
+    Cache reuse is gated on a content *fingerprint* of the inputs (not mere path
+    existence): a cache is only reused if its sidecar ``*.manifest.json`` carries a
+    fingerprint matching the current inputs.  Pass ``force=True``
+    (``--force-retranslate``) to bypass the cache unconditionally.
 
     Parameters
     ----------
@@ -386,7 +616,16 @@ def translate_catalog(
     n_jobs : int
         Passed to ``joblib.Parallel``.  -1 uses all available cores.
     cache_path : str, optional
-        Path for result caching (CSV or FITS).
+        Path for result caching (CSV or FITS).  A ``<cache_path>.manifest.json``
+        fingerprint sidecar is written alongside it.
+    force : bool
+        If True, ignore any existing cache and retranslate.
+    snr_hsc : bool
+        If True (default), fill SNR ``_pred`` columns from HSC v3 (see
+        ``apply_snr_hsc_bypass``).  SNRs bypass SED fitting.
+    snr_hsc_cache_dir : str or Path, optional
+        Per-source HSC cache directory for the SNR bypass.  Defaults to
+        ``config.QUERY_CACHE_DIR / 'hsc_snr_fix'``.
 
     Returns
     -------
@@ -399,12 +638,35 @@ def translate_catalog(
     class, missing fraction per output filter.
     """
     from xclass.io import load_catalog, save_catalog
-    from pathlib import Path
 
-    # Return cached result if available
+    fingerprint = _translate_cache_fingerprint(df, all_filter_names, agn_composite)
+
+    # Reuse the cache ONLY when the input fingerprint matches — never on mere path
+    # existence (which silently reused stale/pre-SNR caches).
     if cache_path and Path(cache_path).exists():
-        log.info("translate_catalog: loading from cache %s", cache_path)
-        return load_catalog(cache_path)
+        if force:
+            log.warning("translate_catalog: --force-retranslate set — ignoring "
+                        "existing cache %s and retranslating.", cache_path)
+        else:
+            manifest = _read_cache_manifest(cache_path)
+            p = Path(cache_path)
+            import time as _time
+            mtime = _time.strftime("%Y-%m-%d %H:%M:%S",
+                                   _time.localtime(p.stat().st_mtime))
+            if manifest and manifest.get("fingerprint") == fingerprint:
+                log.warning(
+                    "translate_catalog: REUSING cache %s (%s rows, mtime %s) — input "
+                    "fingerprint matches. Pass --force-retranslate to override.",
+                    cache_path, manifest.get("n_rows", "?"), mtime,
+                )
+                return load_catalog(cache_path)
+            reason = ("no/unreadable manifest" if manifest is None
+                      else "input fingerprint changed")
+            log.warning(
+                "translate_catalog: IGNORING stale cache %s (%s; mtime %s) — the "
+                "inputs do not match this cache. Retranslating.",
+                cache_path, reason, mtime,
+            )
 
     from joblib import Parallel, delayed
     try:
@@ -426,6 +688,12 @@ def translate_catalog(
     pred_df = pd.DataFrame(results, index=df.index)
     out = pd.concat([df, pred_df], axis=1)
 
+    # SNR bypass: SNRs carry real HST photometry (nothing to SED-translate); slot
+    # HSC v3 magnitudes directly into the _pred columns.  Fails loudly on total loss.
+    if snr_hsc:
+        cdir = snr_hsc_cache_dir or (config.QUERY_CACHE_DIR / "hsc_snr_fix")
+        out = apply_snr_hsc_bypass(out, cdir)
+
     # Summary logging
     if "xclass_sed_family" in pred_df.columns:
         family_counts = pred_df["xclass_sed_family"].value_counts()
@@ -445,6 +713,7 @@ def translate_catalog(
 
     if cache_path:
         save_catalog(out, cache_path)
-        log.info("translate_catalog: saved to %s", cache_path)
+        _write_cache_manifest(cache_path, fingerprint, len(out))
+        log.info("translate_catalog: saved to %s (+ manifest)", cache_path)
 
     return out

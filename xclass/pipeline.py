@@ -14,6 +14,7 @@ Reproduces the published numbers: LMXB F1 = 0.77, HMXB F1 = 0.95, balanced acc =
 """
 from __future__ import annotations
 
+import logging
 import warnings
 from pathlib import Path
 
@@ -36,6 +37,10 @@ from xclass import config
 from xclass.features import build_feature_matrix
 
 warnings.filterwarnings("ignore")
+# NOTE: the blanket warnings filter above suppresses ``warnings.warn`` from this
+# module, so the class-presence guard below reports through ``logging`` + ``print``
+# (which are NOT suppressed) to stay visible.
+log = logging.getLogger("xclass.pipeline")
 ROOT = Path(__file__).resolve().parent.parent
 
 # ── constants ─────────────────────────────────────────────────────────────────
@@ -113,6 +118,105 @@ def make_rf() -> RandomForestClassifier:
     return RandomForestClassifier(**RF_PARAMS)
 
 
+def check_class_presence(labels7: np.ndarray) -> None:
+    """Validate that the training data contains the classes the published two-stage
+    configuration assumes.
+
+    The pipeline must never let a missing class surface as an opaque numpy broadcast
+    error deep inside the OOF computation.  This guard:
+
+    * emits a clear WARNING (via ``logging`` + ``print``) naming every expected
+      Stage-1 / Stage-2 class that is entirely absent, stating that results will
+      not match the published configuration; and
+    * raises a clear, actionable error when the absence makes two-stage training
+      impossible.
+
+    Survivability judgement
+    -----------------------
+    * A missing minority class (SNR, or an individual Stage-2 class such as CV) is
+      *survivable*: the classifier simply cannot predict it.  We warn loudly.
+    * Fewer than two Stage-1 classes is *fatal*: an RF cannot be trained on one
+      class.
+    * An empty Stage-1 ``OTHER`` bin (no LMXB/HMXB/CV at all) is *fatal*: Stage 2
+      has no training data.
+    """
+    labels7 = np.asarray(labels7)
+    labels1 = np.array([STAGE1_MAP[c] for c in labels7])
+    present_s1 = set(np.unique(labels1))
+    present_final = set(np.unique(labels7))
+
+    def _warn(msg: str) -> None:
+        log.warning(msg)
+        print(f"  [WARNING] {msg}")
+
+    for c in S1_CLASSES:
+        if c not in present_s1:
+            _warn(
+                f"Stage-1 class '{c}' is ENTIRELY ABSENT from the training data. "
+                f"Training will proceed on {sorted(present_s1)} only; results will "
+                f"NOT match the published optical-baseline configuration "
+                f"(expected Stage-1 classes {S1_CLASSES})."
+            )
+
+    if len(present_s1) < 2:
+        raise ValueError(
+            f"Training data contains fewer than two Stage-1 classes "
+            f"(present: {sorted(present_s1)}). A Random Forest cannot be trained on "
+            f"a single class. Check the input catalog and the optical-baseline "
+            f"filter (>=1 non-NaN PHAT _pred column)."
+        )
+    if "OTHER" not in present_s1:
+        raise ValueError(
+            "No Stage-2 source classes (LMXB/HMXB/CV) are present in the training "
+            "data, so the Stage-1 'OTHER' bin is empty and Stage 2 cannot be "
+            "trained. Check the input catalog."
+        )
+
+    for c in S2_CLASSES:
+        if c not in present_final:
+            _warn(
+                f"Stage-2 class '{c}' is absent from the training data; Stage 2 "
+                f"cannot predict it. Results will not match the published "
+                f"configuration (expected Stage-2 classes {S2_CLASSES})."
+            )
+
+
+def _oof_stage1_probs(X: np.ndarray, y1: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Out-of-fold Stage-1 ``predict_proba``, column-aligned to the Stage-1 classes
+    actually present in *y1*.
+
+    The OOF matrix width is derived from the fitted data (the number of distinct
+    Stage-1 classes present) — NOT a hardcoded constant — and each fold's
+    ``predict_proba`` output is mapped onto the global columns via the fold
+    estimator's ``classes_``, so columns never silently mis-align when an individual
+    fold's training split is missing a class.
+
+    When all Stage-1 classes are present (the published configuration), ``present``
+    is ``[0, 1, 2, 3]`` and every fold's ``classes_`` matches, so the mapping is the
+    identity and the result is bit-for-bit identical to the previous
+    ``oof[va] = predict_proba(...)`` behaviour.
+
+    Returns
+    -------
+    oof : ndarray, shape (len(X), n_present)
+        The OOF Stage-1 probabilities.
+    present : ndarray
+        Encoded Stage-1 class labels, sorted; the column order of *oof*.
+    """
+    present = np.unique(y1)                        # encoded labels present globally
+    col_of = {int(c): i for i, c in enumerate(present)}
+    oof = np.zeros((len(X), len(present)), dtype=float)
+    skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True,
+                          random_state=config.RANDOM_STATE)
+    for tr, va in skf.split(X, y1):
+        s1 = make_rf()
+        s1.fit(X[tr], y1[tr])
+        proba = s1.predict_proba(X[va])
+        for j, c in enumerate(s1.classes_):
+            oof[va, col_of[int(c)]] = proba[:, j]
+    return oof, present
+
+
 # ── two-stage CV ──────────────────────────────────────────────────────────────
 
 def two_stage_cv(df: pd.DataFrame) -> dict:
@@ -125,6 +229,7 @@ def two_stage_cv(df: pd.DataFrame) -> dict:
     X, _ = impute_median(feat_df)
 
     labels7 = df["Class"].values
+    check_class_presence(labels7)
     labels1 = np.array([STAGE1_MAP[c] for c in labels7])
     labels6 = np.array(["STAR" if c in ("LM-STAR", "HM-STAR") else c for c in labels7])
 
@@ -139,7 +244,12 @@ def two_stage_cv(df: pd.DataFrame) -> dict:
                           random_state=config.RANDOM_STATE)
 
     s1_true_oof, s1_pred_oof, s1_conf_oof = [], [], []
-    s1_probs_oof = np.zeros((len(df), len(S1_CLASSES)))   # full 4-class prob matrix
+    # Probability-matrix width is derived from the Stage-1 classes actually present
+    # (NOT a hardcoded 4); per-fold columns are mapped via ``s1.classes_`` below so
+    # they stay aligned even if a fold's split is missing a class.
+    s1_present = np.unique(y1)
+    s1_col_of  = {int(c): i for i, c in enumerate(s1_present)}
+    s1_probs_oof = np.zeros((len(df), len(s1_present)))
     fp_true_oof, fp_pred_oof, fp_conf_oof = [], [], []
     importances = []
     oof_indices = []
@@ -160,7 +270,8 @@ def two_stage_cv(df: pd.DataFrame) -> dict:
         s1_true_oof.extend(le1.inverse_transform(y1_va))
         s1_pred_oof.extend(le1.inverse_transform(s1_pred_va))
         s1_conf_oof.extend(s1_prob_va.max(axis=1))
-        s1_probs_oof[va_idx] = s1_prob_va
+        for _j, _c in enumerate(s1.classes_):
+            s1_probs_oof[va_idx, s1_col_of[int(_c)]] = s1_prob_va[:, _j]
         oof_indices.extend(va_idx)
 
         # Stage 2 — trained on OTHER sources in training fold
@@ -191,8 +302,8 @@ def two_stage_cv(df: pd.DataFrame) -> dict:
         "s1_true":      np.array(s1_true_oof),
         "s1_pred":      np.array(s1_pred_oof),
         "s1_conf":      np.array(s1_conf_oof,  dtype=float),
-        "s1_probs":     s1_probs_oof,            # (N, 4) full probability matrix
-        "s1_classes":   le1.classes_,
+        "s1_probs":     s1_probs_oof,            # (N, n_present) probability matrix
+        "s1_classes":   le1.inverse_transform(s1_present),   # aligned to s1_probs cols
         "fp_true":      np.array(fp_true_oof),
         "fp_pred":      np.array(fp_pred_oof),
         "fp_conf":      np.array(fp_conf_oof,  dtype=float),
@@ -530,6 +641,7 @@ def train_and_save_production_model(df: pd.DataFrame) -> None:
     X, medians = impute_median(feat_df)
 
     labels7 = df["Class"].values
+    check_class_presence(labels7)
     labels1 = np.array([STAGE1_MAP[c] for c in labels7])
 
     le1 = LabelEncoder().fit(S1_CLASSES)
@@ -539,15 +651,13 @@ def train_and_save_production_model(df: pd.DataFrame) -> None:
 
     other_idx = np.where(labels1 == "OTHER")[0]
 
-    # Step 1: OOF Stage-1 probabilities for Stage-2 training (avoids leakage)
+    # Step 1: OOF Stage-1 probabilities for Stage-2 training (avoids leakage).
+    # The OOF matrix width is derived from the Stage-1 classes actually present and
+    # is column-aligned via each fold's ``classes_`` (see ``_oof_stage1_probs``), so
+    # a missing class produces correct, aligned probabilities instead of an opaque
+    # numpy broadcast error. Identical output to before when all classes are present.
     print(f"  Computing OOF Stage-1 probs for Stage-2 training…")
-    oof_s1_probs = np.zeros((len(df), len(S1_CLASSES)))
-    skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True,
-                          random_state=config.RANDOM_STATE)
-    for tr, va in skf.split(X, y1):
-        s1_tmp = make_rf()
-        s1_tmp.fit(X[tr], y1[tr])
-        oof_s1_probs[va] = s1_tmp.predict_proba(X[va])
+    oof_s1_probs, _s1_present = _oof_stage1_probs(X, y1)
 
     # Step 2: Stage 2 on OTHER sources using OOF Stage-1 probs
     print(f"  Training Stage 2 ({len(other_idx)} OTHER sources)…")
@@ -608,6 +718,26 @@ def build_optical_baseline() -> pd.DataFrame:
     present = [c for c in pred_cols if c in df_full.columns]
     n_optical = df_full[present].notna().sum(axis=1)
     df_opt = df_full[n_optical >= 1].copy().reset_index(drop=True)
+
+    # Backstop: if the full catalog contains SNR-labelled rows but none survive the
+    # optical cut, the SNR class has been silently dropped — the classic symptom of
+    # a translate run that skipped the SNR HSC photometry step. Warn loudly and name
+    # the cause so it can never pass unnoticed as a 3-class model.
+    if "Class" in df_full.columns:
+        n_snr_full = int((df_full["Class"] == "SNR").sum())
+        n_snr_opt = int((df_opt["Class"] == "SNR").sum()) if "Class" in df_opt.columns else 0
+        if n_snr_full > 0 and n_snr_opt == 0:
+            log.warning(
+                "build_optical_baseline: %d SNR sources in the full catalog but ZERO "
+                "have any PHAT _pred — the SNR class is being dropped. The translate "
+                "stage did not fill SNR HSC photometry (run translate with the SNR "
+                "bypass / --snr-hsc-cache). The resulting model will be 3-class and "
+                "will NOT reproduce the published catalog.",
+                n_snr_full,
+            )
+            print("  [WARNING] SNR class dropped from optical baseline — SNR HSC "
+                  "photometry missing; result will not match the published catalog.")
+
     df_opt.to_csv(OPTICAL_CATALOG, index=False)
     print(f"  optical baseline: N={len(df_opt):,} -> {OPTICAL_CATALOG}")
     return df_opt

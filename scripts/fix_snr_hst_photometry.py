@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""Fix SNR HST photometry in translated_catalog.csv.
+"""SNR HST photometry — DIAGNOSTIC (CV / masquerade / figures).
 
-SNR training sources have no SED-translated HST magnitudes (all NaN in
-the *_pred columns) because they bypass the SED translation stage.  The
-original design assumed they would carry real HST photometry in A_F*
-columns, but that crossmatch was never executed, leaving all optical
-features NaN — an artefact that the classifier exploits.
+.. note::
+   The SNR HSC photometry *fix* is now part of the production pipeline: the
+   ``translate`` stage fills the six PHAT ``*_pred`` columns for SNRs directly
+   from HSC v3 (``xclass.photometry.apply_snr_hsc_bypass``). **This script no
+   longer mutates ``translated_catalog.csv``** — it is a pure diagnostic that
+   compares the "before" (SNRs all-NaN → column median) and "after" (real HSC
+   photometry) states and writes ``figures/snr_hst_fix.pdf``.
 
-This script:
-1. Queries HSC v3 for all 150 SNR training sources using their
-   optical positions (td_ra/td_dec).
-2. Populates the six PHAT *_pred columns with the real HSC magnitudes
-   for SNRs that have an HSC counterpart within 0.5 arcsec.
-3. Saves the corrected translated_catalog.csv.
-4. Re-runs 5-fold CV (baseline vs. fixed) and the masquerade test,
-   then prints a full summary.
+SNR training sources have no SED-translated HST magnitudes (all NaN in the
+*_pred columns) because they bypass SED translation; the classifier can exploit
+the resulting NaN→median artefact. This diagnostic:
+1. Queries HSC v3 for all 150 SNR training sources using their optical positions
+   (td_ra/td_dec).
+2. Builds an in-memory "fixed" catalog (real HSC magnitudes within 0.5 arcsec).
+3. Re-runs 5-fold CV (baseline vs. fixed) and the masquerade test.
+4. Prints a full summary and saves the comparison figure. No catalog on disk is
+   modified.
 
 Usage::
 
@@ -535,10 +538,12 @@ def main():
     log.info("\n=== Masquerade test: Fixed ===")
     masq_fixed = run_masquerade(feat_fixed, df_fixed["Class"], n_runs=5)
 
-    # 10. Save patched catalog
-    out_path = config.PROCESSED_DIR / "translated_catalog.csv"
-    df_fixed.to_csv(out_path, index=False)
-    log.info("Saved patched catalog → %s", out_path)
+    # 10. (Diagnostic only) — do NOT write translated_catalog.csv.
+    # The SNR HSC photometry is now produced inside the `translate` pipeline stage
+    # (xclass.photometry.apply_snr_hsc_bypass). This script is a pure
+    # CV / masquerade / figure diagnostic and no longer mutates the catalog on disk.
+    log.info("Diagnostic run only — translated_catalog.csv is NOT modified "
+             "(SNR HSC photometry is produced by the translate stage).")
 
     # 11. Save figures
     make_figures(res_baseline, res_fixed, masq_baseline, masq_fixed)

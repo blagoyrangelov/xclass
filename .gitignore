@@ -9,6 +9,13 @@ models/
 targets/*/processed/
 targets/*/plots/
 
+# SED-translation cache — never ship it. It is reused only when its input
+# fingerprint matches (see photometry.translate_catalog); a stale copy must not be
+# distributed, or a fresh run could silently reuse it. Regenerate with
+# `run_pipeline.py --stage translate` (or --force-retranslate).
+sed_translation_cache.csv
+sed_translation_cache.csv.manifest.json
+
 # Build artifacts
 build/
 dist/

@@ -595,8 +595,13 @@ def _hsc_fetch_one(
     dec: float,
     search_radius_arcsec: float,
     cache_dir: Path,
-) -> list[dict]:
-    """Single-source HSC v3 REST query with per-source disk caching."""
+) -> Optional[list[dict]]:
+    """Single-source HSC v3 REST query with per-source disk caching.
+
+    Returns a list of detection dicts on success (an empty list means a genuine
+    "no HSC counterpart", which IS cached), or ``None`` on a network/API failure
+    (NOT cached, so the query can be retried on a later run).
+    """
     cached = _load_cache(xray_id, cache_dir)
     if cached is not None:
         return cached
@@ -636,9 +641,11 @@ def _hsc_fetch_one(
         time.sleep(config.HSC_REQUEST_SLEEP_SEC)
         data = _do_get()
     except Exception as exc:
+        # Network / API error is NOT the same as "no counterpart".  Do NOT cache
+        # the failure (so a later run can retry) and return None so callers can
+        # distinguish an HSC outage from a genuine empty response (which is []).
         log.warning("HSC query failed for source %s: %s", xray_id, exc)
-        _save_cache(xray_id, cache_dir, [])
-        return []
+        return None
 
     # New MAST API format: {"info": [{name, ...}, ...], "data": [[v1, v2, ...], ...]}
     # Convert to list-of-dicts keyed by column name.
@@ -737,6 +744,10 @@ def query_hsc_for_chandra_sources(
         )
 
         detections = _hsc_fetch_one(xray_id, xray_ra, xray_dec, search_r, cdir)
+        if detections is None:
+            # Network failure for this source: treat as no match here (the apply
+            # path tolerates missing HSC), but it was not cached, so a re-run retries.
+            detections = []
 
         src_coord = SkyCoord(ra=xray_ra * u.deg, dec=xray_dec * u.deg)
         det_rows: list[dict] = []

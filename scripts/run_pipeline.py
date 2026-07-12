@@ -215,7 +215,10 @@ def _build_snr_xray_rows(snr_path: Path, chandra_path: Path,
     pos_err_arcsec = np.where(pos_err_arcsec > 0, pos_err_arcsec, 1.0)
 
     rows = pd.DataFrame({
-        # Training label
+        # Training label — set BOTH the prefixed td_Class and the canonical Class
+        # column.  A fresh concat leaves Class=NaN for SNR rows otherwise, which
+        # both hides them from the SNR HSC bypass and breaks STAGE1_MAP at train.
+        "Class":               "SNR",
         "td_Class":            "SNR",
         "td_canonical_name":   snr_m["source_name"].values,
         "td_name_norm":        snr_m["source_name"].str.lower().values,
@@ -252,12 +255,15 @@ def _build_snr_xray_rows(snr_path: Path, chandra_path: Path,
     return rows
 
 
-def stage_translate(filter_set: str = "PHAT", dry_run: bool = False) -> None:
-    """SED-translate survey photometry to HST filter set."""
+def stage_translate(filter_set: str = "PHAT", dry_run: bool = False,
+                    force_retranslate: bool = False,
+                    snr_hsc_cache: "Path | None" = None) -> None:
+    """SED-translate survey photometry to HST filter set (SNRs filled from HSC v3)."""
     log.info("=== Stage: translate (filter_set=%s) ===", filter_set)
     if dry_run:
         log.info("[dry-run] Would call photometry.translate_catalog() "
-                 "with filter_set=%s", filter_set)
+                 "with filter_set=%s (force_retranslate=%s, snr_hsc_cache=%s)",
+                 filter_set, force_retranslate, snr_hsc_cache)
         return
 
     import pandas as pd
@@ -300,6 +306,8 @@ def stage_translate(filter_set: str = "PHAT", dry_run: bool = False) -> None:
         pickles_cache=pickles_cache,
         agn_composite=agn_composite,
         cache_path=config.PROCESSED_DIR / "sed_translation_cache.csv",
+        force=force_retranslate,
+        snr_hsc_cache_dir=snr_hsc_cache,
     )
     log.info("Translated catalog: %d rows", len(translated))
 
@@ -439,6 +447,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print what would happen but do not execute any pipeline code.",
     )
     parser.add_argument(
+        "--force-retranslate",
+        action="store_true",
+        default=False,
+        help="Translate stage: ignore any existing SED-translation cache and "
+             "retranslate from scratch (defeats stale-cache reuse).",
+    )
+    parser.add_argument(
+        "--snr-hsc-cache",
+        type=Path,
+        default=None,
+        help="Translate stage: directory of per-source HSC v3 caches for the SNR "
+             "photometry bypass (offline reproducibility). Default: "
+             "data/query_cache/hsc_snr_fix.",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -475,14 +498,18 @@ def main() -> None:
     if stage == "all":
         stage_build_td(dry_run=dry)
         stage_crossmatch(dry_run=dry)
-        stage_translate(filter_set=fs, dry_run=dry)
+        stage_translate(filter_set=fs, dry_run=dry,
+                        force_retranslate=args.force_retranslate,
+                        snr_hsc_cache=args.snr_hsc_cache)
         stage_train(filter_set=fs, dry_run=dry)
     elif stage == "build_td":
         stage_build_td(dry_run=dry)
     elif stage == "crossmatch":
         stage_crossmatch(dry_run=dry)
     elif stage == "translate":
-        stage_translate(filter_set=fs, dry_run=dry)
+        stage_translate(filter_set=fs, dry_run=dry,
+                        force_retranslate=args.force_retranslate,
+                        snr_hsc_cache=args.snr_hsc_cache)
     elif stage == "train":
         stage_train(filter_set=fs, dry_run=dry)
     elif stage == "evaluate":

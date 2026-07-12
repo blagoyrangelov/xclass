@@ -115,7 +115,7 @@ def match_td_to_chandra(
     chandra_df: pd.DataFrame,
     nsigma: float = 3.0,
 ) -> pd.DataFrame:
-    """Match training-dataset sources to Chandra CSC 2.0 detections.
+    """Match training-dataset sources to Chandra CSC 2.1.1 detections.
 
     For each TD source, finds Chandra sources within the positional search
     radius using ``astropy.coordinates.search_around_sky``.

@@ -547,9 +547,18 @@ def load_agn_composite(
         except Exception as exc:
             log.debug("AGN composite download failed from %s: %s", url, exc)
 
-    warnings.warn(
+    _msg = (
         "Failed to load Vanden Berk 2001 AGN composite spectrum after all attempts. "
-        "SED fitting for AGN will fall back to power-law grid.",
-        stacklevel=2,
+        "SED fitting for AGN will fall back to the power-law grid. This SILENTLY "
+        "CHANGES the SED model for the entire AGN class and can alter the training "
+        "set (AGN with no valid power-law fit are dropped by the optical-baseline "
+        "filter), so results may not match the published configuration. To restore "
+        "the published behaviour, provide the composite via $PYSYN_CDBS or a cached "
+        f"'{_AGN_COMPOSITE_CACHE_NAME}' in the spectra cache directory."
     )
+    # Route through logging.error AND warnings.warn: callers that filter warnings
+    # (e.g. xclass.pipeline runs under warnings.filterwarnings("ignore")) would
+    # otherwise never see this reproducibility-critical substitution.
+    log.error(_msg)
+    warnings.warn(_msg, stacklevel=2)
     return None, None
