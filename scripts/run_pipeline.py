@@ -315,6 +315,35 @@ def stage_translate(filter_set: str = "PHAT", dry_run: bool = False,
     translated.to_csv(out_path, index=False)
     log.info("Saved to %s", out_path)
 
+    # ── Run manifest (instrumentation only — records what actually happened) ───
+    from datetime import datetime
+    from xclass import manifest as _manifest
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # AGN composite present iff a real (wave, flux) tuple was loaded.  If it is
+    # None / (None, None), the AGN fit silently fell back to a power law.
+    agn_ok = agn_composite is not None and agn_composite[0] is not None
+    # Live SNR HSC counters (patched / no-counterpart / network failures) attached
+    # by apply_snr_hsc_bypass.  Absent when translate reused its cache, in which
+    # case counts are derived from the catalog and this is flagged as a cache hit.
+    snr_counts = translated.attrs.get("xclass_snr_hsc")
+    cache_hit = snr_counts is None
+    # Optical-baseline preview: same ">=1 non-NaN PHAT _pred" cut used to build the
+    # production catalog, computed read-only (writes nothing).
+    pred_cols = [f"{f}_pred" for f in config.PHAT_FILTER_SET
+                 if f"{f}_pred" in translated.columns]
+    n_optical = (int((translated[pred_cols].notna().sum(axis=1) >= 1).sum())
+                 if pred_cols else None)
+
+    m = _manifest.build_translate_manifest(
+        translated, timestamp=ts, n_optical=n_optical,
+        agn_composite_available=agn_ok, snr_counts=snr_counts,
+        cache_hit=cache_hit, force=force_retranslate,
+    )
+    mpath = m.write(config.PROCESSED_DIR)
+    print(m.format_summary())
+    log.info("Run manifest written to %s", mpath)
+
 
 def stage_train(filter_set: str = "PHAT", dry_run: bool = False) -> None:
     """Train + save the production two-stage classifier (optical baseline N=11,374,

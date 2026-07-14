@@ -80,8 +80,15 @@ def _ps1_fetch_one(
     dec: float,
     radius_arcsec: float,
     cache_dir: Path,
-) -> dict:
-    """Single-source PS1 query with per-source disk caching."""
+) -> Optional[dict]:
+    """Single-source PS1 query with per-source disk caching.
+
+    Returns a result dict on success (``ps1_available`` True/False — a False
+    result is a genuine non-detection and IS cached), or ``None`` on a
+    network/API failure (NOT cached, so the query is retried on a later run).
+    Mirrors the ``_hsc_fetch_one`` contract so all three survey paths behave
+    consistently.
+    """
     cached = _load_cache(source_id, cache_dir)
     if cached is not None:
         return cached
@@ -123,10 +130,12 @@ def _ps1_fetch_one(
     try:
         data = _do_get()
     except Exception as exc:
+        # Network / API error is NOT a non-detection.  Do NOT cache the failure
+        # (so a later run retries it) and return None so query_panstarrs can
+        # distinguish a PS1 outage from a genuine "no counterpart" (which is a
+        # cached ps1_available=False result).
         log.warning("PS1 query failed for source %s: %s", source_id, exc)
-        result = {"source_id": source_id, "ps1_available": False, "n_ps1_candidates": 0}
-        _save_cache(source_id, cache_dir, result)
-        return result
+        return None
 
     # MAST JSON response: {"info": [{"name": col, ...}, ...], "data": [[v1, v2, ...], ...]}
     # Convert list-of-lists to list-of-dicts using column names from "info".
@@ -238,9 +247,37 @@ def query_panstarrs(
         for _, row in sources_df.iterrows()
     )
 
-    out = pd.DataFrame(results)
+    # A None result is a network failure (not cached, retryable) and must NOT be
+    # counted as a genuine non-detection.  Emit a placeholder row so the output
+    # shape is unchanged, but flagged distinctly.
+    n_net_fail = 0
+    rows: list[dict] = []
+    for i, res in enumerate(results):
+        if res is None:
+            n_net_fail += 1
+            rows.append({
+                "source_id": str(sources_df.iloc[i]["source_id"]),
+                "ps1_available": False,
+                "ps1_query_failed": True,
+                "n_ps1_candidates": 0,
+            })
+        else:
+            rows.append(res)
+
+    out = pd.DataFrame(rows)
     n_with = int(out["ps1_available"].sum()) if "ps1_available" in out.columns else 0
-    log.info("query_panstarrs: %d sources, %d with PS1 match", len(sources_df), n_with)
+    n_nondet = len(sources_df) - n_with - n_net_fail
+    log.info("query_panstarrs: %d sources, %d with PS1 match "
+             "(%d genuine non-detections, %d network failures)",
+             len(sources_df), n_with, n_nondet, n_net_fail)
+    if n_net_fail > 0:
+        log.warning(
+            "query_panstarrs: %d/%d PS1 queries FAILED on the network (not "
+            "non-detections). The resulting catalog is UNDER-POPULATED and may not "
+            "match the published configuration. Failures are NOT cached, so re-run "
+            "when the PS1/MAST service is reachable to retry them.",
+            n_net_fail, len(sources_df),
+        )
     return out
 
 
@@ -254,8 +291,14 @@ def _tmass_fetch_one(
     dec: float,
     radius_arcsec: float,
     cache_dir: Path,
-) -> list[dict]:
-    """Single-source 2MASS VizieR query with caching."""
+) -> Optional[list[dict]]:
+    """Single-source 2MASS VizieR query with caching.
+
+    Returns a list of candidate dicts on success (an empty list is a genuine
+    "no 2MASS counterpart", which IS cached), or ``None`` on a network/API
+    failure (NOT cached, so the query is retried on a later run).  Mirrors the
+    ``_hsc_fetch_one`` contract so all three survey paths behave consistently.
+    """
     cached = _load_cache(source_id, cache_dir)
     if cached is not None:
         return cached
@@ -286,10 +329,14 @@ def _tmass_fetch_one(
     try:
         result_list = _query()
     except Exception as exc:
+        # Network / API error is NOT a non-detection.  Do NOT cache the failure
+        # (so a later run retries it) and return None so query_2mass can
+        # distinguish a 2MASS/VizieR outage from a genuine empty response (which
+        # is a cached []).
         log.warning("2MASS query failed for source %s: %s", source_id, exc)
-        _save_cache(source_id, cache_dir, [])
-        return []
+        return None
 
+    # Genuine non-detection: the query SUCCEEDED and returned no rows.  Cache [].
     if not result_list or len(result_list) == 0:
         _save_cache(source_id, cache_dir, [])
         return []
@@ -388,14 +435,27 @@ def query_2mass(
     )
 
     all_rows: list[dict] = []
+    n_net_fail = n_nondet = n_match = 0
     for i, candidates in enumerate(results_nested):
         sid = str(sources_df.iloc[i]["source_id"])
-        if candidates:
+        if candidates is None:
+            # Network failure (not cached, retryable) — NOT a non-detection.
+            n_net_fail += 1
+            all_rows.append({
+                "source_id": sid,
+                "tmass_available": False,
+                "tmass_query_failed": True,
+                "n_tmass_candidates": 0,
+            })
+        elif candidates:
+            n_match += 1
             n = len(candidates)
             for c in candidates:
                 c["n_tmass_candidates"] = n
             all_rows.extend(candidates)
         else:
+            # Genuine non-detection (query succeeded, no counterpart).
+            n_nondet += 1
             all_rows.append({
                 "source_id": sid,
                 "tmass_available": False,
@@ -403,8 +463,17 @@ def query_2mass(
             })
 
     out = pd.DataFrame(all_rows)
-    n_with = int(out["tmass_available"].sum()) if "tmass_available" in out.columns else 0
-    log.info("query_2mass: %d sources, %d with 2MASS match", len(sources_df), n_with)
+    log.info("query_2mass: %d sources, %d with 2MASS match "
+             "(%d genuine non-detections, %d network failures)",
+             len(sources_df), n_match, n_nondet, n_net_fail)
+    if n_net_fail > 0:
+        log.warning(
+            "query_2mass: %d/%d 2MASS queries FAILED on the network (not "
+            "non-detections). The resulting catalog is UNDER-POPULATED and may not "
+            "match the published configuration. Failures are NOT cached, so re-run "
+            "when the 2MASS/VizieR service is reachable to retry them.",
+            n_net_fail, len(sources_df),
+        )
     return out
 
 

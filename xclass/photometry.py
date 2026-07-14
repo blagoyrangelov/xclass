@@ -525,6 +525,15 @@ def apply_snr_hsc_bypass(
             "cached) or supply --snr-hsc-cache.",
             n_lost, n_snr, n_net_fail, n_no_counterpart,
         )
+    # Record live counters as metadata for the run manifest.  This is pure
+    # instrumentation (pandas .attrs is not written to CSV and does not affect
+    # any computed value); it lets stage_translate report the true network-
+    # failure count rather than deriving 0 post-hoc from the catalog.
+    out.attrs["xclass_snr_hsc"] = {
+        "patched": int(n_patched),
+        "no_counterpart": int(n_no_counterpart),
+        "network_failures": int(n_net_fail),
+    }
     return out
 
 
@@ -701,8 +710,25 @@ def translate_catalog(
 
     class_col = next((c for c in ["Class", "class_label"] if c in out.columns), None)
     if class_col and "xclass_fit_chi2red" in out.columns:
-        mean_chi2 = out.groupby(class_col)["xclass_fit_chi2red"].mean()
-        log.info("Mean chi2_reduced per class:\n%s", mean_chi2.to_string())
+        # Report the MEDIAN chi2_reduced (the statistic quoted in the manuscript).
+        # The distribution is heavy-tailed — values reach ~1e20 for bright stars
+        # whose tiny formal photometric errors are divided into a small mismatch
+        # against the discrete Pickles grid — so the mean is outlier-dominated and
+        # misleading (it prints e.g. LM-STAR ~1e16).  No numerical guard on
+        # chi2_reduced is needed or applied: it feeds only sigma_base =
+        # min(0.1*sqrt(chi2r), 1.0), which saturates at chi2r >= 100, and the raw
+        # value is never used as a classifier feature.  We log median (primary),
+        # plus mean and Q90 for context, all clearly labelled.
+        grp = out.groupby(class_col)["xclass_fit_chi2red"]
+        chi2_summary = pd.DataFrame({
+            "median": grp.median(),
+            "mean": grp.mean(),
+            "q90": grp.quantile(0.90),
+            "N": grp.count(),
+        })
+        log.info("chi2_reduced per class (median = published statistic; "
+                 "mean is outlier-dominated, shown for context only):\n%s",
+                 chi2_summary.to_string())
 
     for filt_name in all_filter_names:
         col = f"{filt_name}_pred"
