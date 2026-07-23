@@ -27,9 +27,10 @@ translate ground-based photometry into HST PHAT bandpasses, builds a uniform
 
 ## Paper reference
 
-Rangelov, B. et al. 2026, *The Astrophysical Journal*, **submitted**.
-*"Automated multi-wavelength classification of extragalactic X-ray point
-sources in nearby spiral galaxies."*
+Rangelov, B., Moore, N., Dutton, H., & Marentes, E. 2026,
+*The Astrophysical Journal*, [10.3847/1538-4357/ae8d15](https://doi.org/10.3847/1538-4357/ae8d15).
+*"XClass: An Automated Multiwavelength Machine-Learning Pipeline for
+Classification of Extragalactic X-ray Sources. I. Pipeline Description."*
 
 ## Installation
 
@@ -58,6 +59,14 @@ python scripts/run_pipeline.py --stage train      # train + save production mode
 These reproduce the cross-validation metrics, the confusion matrices (LMXB→CV =
 0.26), the per-class numbers (Table 5), the calibration diagram, and the
 feature-importance figure in `figures/`.
+
+**Reproducibility note.** The training catalog reproduces exactly (N = 11,374,
+with all four Stage-1 classes present). Cross-validation metrics reproduce to
+within ~0.02 of the published values; small differences arise from
+scikit-learn/numpy version drift rather than from the pipeline itself. Each
+stage writes a run manifest recording the exact library versions used, the SED
+models actually applied (including any fallbacks), and the status of every
+external data query — check it if your numbers differ from the paper.
 
 ## Pipeline stages (CLI)
 
@@ -162,12 +171,14 @@ If you use XClass in your work, please cite:
 
 ```bibtex
 @article{Rangelov2026,
-    author       = {Rangelov, B. and {others}},
-    title        = {Automated multi-wavelength classification of extragalactic
-                    X-ray point sources in nearby spiral galaxies},
+    author       = {Rangelov, Blagoy and Moore, Nicholas and
+                    Dutton, Haley and Marentes, Erika},
+    title        = {{XClass: An Automated Multiwavelength Machine-Learning
+                    Pipeline for Classification of Extragalactic X-ray
+                    Sources. I. Pipeline Description}},
     journal      = {The Astrophysical Journal},
     year         = {2026},
-    note         = {submitted}
+    doi          = {10.3847/1538-4357/ae8d15}
 }
 ```
 

@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: >-
   If you use this software, please cite both the software (via this Zenodo
   record) and the accompanying paper (Rangelov et al. 2026).
-title: "blagoyrangelov/xclass: XClass v1.0"
+title: "blagoyrangelov/xclass: XClass v1.1"
 abstract: >-
   XClass is an automated multiwavelength machine-learning pipeline for
   classifying extragalactic X-ray point sources detected by the Chandra
@@ -15,16 +15,13 @@ authors:
     given-names: Blagoy
     affiliation: "Department of Physics, Texas State University, San Marcos, TX 78666, USA"
     orcid: "https://orcid.org/0000-0002-9282-5207"
-version: v1.0
+version: v1.1
 doi: 10.5281/zenodo.20838124
 identifiers:
   - type: doi
     value: 10.5281/zenodo.20838124
     description: "Concept DOI (all versions; always resolves to the latest)"
-  - type: doi
-    value: 10.5281/zenodo.20838125
-    description: "Version DOI (this release, v1.0)"
-date-released: "2026-06-25"
+date-released: "2026-07-23"
 url: "https://github.com/blagoyrangelov/xclass"
 repository-code: "https://github.com/blagoyrangelov/xclass"
 license: MIT
